@@ -5,6 +5,7 @@ module Spree
     index_name Spree::ElasticsearchSettings.index
     document_type 'spree_product'
 
+    # https://github.com/DynamoMTL/spree_elasticsearch/blob/master/app/models/spree/product_decorator.rb
     mapping _all: { analyzer: 'nGram_analyzer', search_analyzer: 'whitespace_analyzer' } do
       indexes :name, type: 'multi_field' do
         indexes :name, type: 'string', analyzer: 'nGram_analyzer', boost: 100
@@ -13,16 +14,20 @@ module Spree
 
       indexes :description, analyzer: 'snowball'
       indexes :available_on, type: 'date', format: 'dateOptionalTime', include_in_all: false
+      indexes :updated_at, type: 'date', format: 'dateOptionalTime', include_in_all: false
       indexes :price, type: 'double'
       indexes :sku, type: 'string', index: 'not_analyzed'
+      indexes :slug, type: 'string', index: 'not_analyzed'
       indexes :taxon_ids, type: 'string', index: 'not_analyzed'
+      indexes :taxon_names, analyzer: 'snowball'
       indexes :properties, type: 'string', index: 'not_analyzed'
     end
 
+    # http://api.rubyonrails.org/classes/ActiveModel/Serializers/JSON.html#method-i-as_json
     def as_indexed_json(options={})
       result = as_json({
         methods: [:price, :sku],
-        only: [:available_on, :description, :name],
+        only: [:available_on, :updated_at, :description, :name, :slug],
         include: {
           variants: {
             only: [:sku],
@@ -35,8 +40,19 @@ module Spree
         }
       })
       result[:properties] = property_list unless property_list.empty?
-      result[:taxon_ids] = taxons.map(&:self_and_ancestors).flatten.uniq.map(&:id) unless taxons.empty?
+      
+      if taxons.present?
+        taxon_with_children = taxons.map(&:self_and_ancestors).flatten.uniq
+        result[:taxon_ids] = taxon_with_children.map(&:id)
+        result[:taxon_names] = taxon_with_children.map(&:name)
+      end
+            
       result
+    end
+    
+    # Must override spree / ransack #search method
+    def self.search(query, options = {})   
+      __elasticsearch__.search(query, options)
     end
 
     def self.get(product_id)
@@ -117,12 +133,12 @@ module Spree
         aggregations = {
           price: { stats: { field: 'price' } },
           properties: { terms: { field: 'properties', order: { _count: 'asc' }, size: 1000000 } },
-          taxon_ids: { terms: { field: 'taxon_ids', size: 1000000 } }
+          taxon_ids: { terms: { field: 'taxon_ids', size: 1000000 } },
+          #max_updated_at: { max: { field: "available_on" } }
         }
 
         # basic skeleton
         result = {
-          min_score: 0.1,
           query: { filtered: {} },
           sort: sorting,
           from: from,
@@ -132,7 +148,7 @@ module Spree
         # add query and filters to filtered
         result[:query][:filtered][:query] = query
         # taxon and property filters have an effect on the facets
-        and_filter << { terms: { taxon_ids: taxons } } unless taxons.empty?
+        and_filter << { terms: { taxon_ids: taxons } } unless taxons.blank?
         # only return products that are available
         and_filter << { range: { available_on: { lte: 'now' } } }
         result[:query][:filtered][:filter] = { and: and_filter } unless and_filter.empty?
